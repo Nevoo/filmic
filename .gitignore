@@ -1,0 +1,23 @@
+# Xcode
+*.xcodeproj/
+xcuserdata/
+DerivedData/
+*.xcworkspace/
+build/
+
+# macOS
+.DS_Store
+
+# Swift Package Manager
+.build/
+Packages/
+Package.resolved
+
+# MCP configuration
+.mcp.json
+
+# LUTs (not distributed with source)
+FilmDev/Resources/LUTs/
+
+# Claude
+.claude/
