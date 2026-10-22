@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-Generate 17x17x17 .cube LUT files for FilmDev film simulations.
+Generate 33x33x33 .cube LUT files for FilmDev film simulations.
 
-Uses physically-inspired film emulsion modeling:
-- H&D characteristic curves in log-exposure / density space
-- Negative film: emulsion → transmittance → print paper → reflectance
-- Slide film: reversal H&D curves → transmittance
-- B&W: weighted luminance → negative H&D → print H&D → optional tint
-- Digital sims: log-space tone curves with artistic adjustments
+All presets use per-channel tone curves + saturation/hue adjustments + split
+toning — the same approach used by professional LUT makers (VSCO, RNI).
 
 Usage:
-    python3 filmdev/scripts/generate_luts.py
+    python3 scripts/generate_luts.py
+    python3 scripts/generate_luts.py --diagnose
 
-Outputs .cube files to filmdev/FilmDev/Resources/LUTs/{fuji,kodak,ilford}/
+Outputs .cube files to FilmDev/Resources/LUTs/{fuji,kodak,ilford}/
 """
 
+import sys
 import numpy as np
 from pathlib import Path
 
@@ -22,16 +20,14 @@ from pathlib import Path
 # LUT infrastructure
 # ---------------------------------------------------------------------------
 
-LUT_SIZE = 17
+LUT_SIZE = 33
 OUTPUT_ROOT = Path(__file__).resolve().parent.parent / "FilmDev" / "Resources" / "LUTs"
 
 
 def identity_lut(size: int = LUT_SIZE) -> np.ndarray:
-    """Return an identity LUT as (size^3, 3) float64 array, B-fastest order for .cube."""
+    """Return an identity LUT as (size^3, 3) float64 array, R-fastest order for .cube."""
     coords = np.linspace(0.0, 1.0, size)
-    # .cube iterates R(slowest), G(middle), B(fastest)
-    # meshgrid indexing="ij": first arg = axis 0 (slowest), last = fastest
-    r, g, b = np.meshgrid(coords, coords, coords, indexing="ij")
+    b, g, r = np.meshgrid(coords, coords, coords, indexing="ij")
     return np.stack([r, g, b], axis=-1).reshape(-1, 3)
 
 
@@ -49,7 +45,7 @@ def write_cube(lut: np.ndarray, path: Path, title: str, size: int = LUT_SIZE):
 
 
 # ---------------------------------------------------------------------------
-# Color-space helpers (kept for digital sims)
+# Color-space helpers
 # ---------------------------------------------------------------------------
 
 def rgb_to_hsl(rgb: np.ndarray) -> np.ndarray:
@@ -110,8 +106,47 @@ def hsl_to_rgb(hsl: np.ndarray) -> np.ndarray:
     return np.clip(rgb, 0, 1)
 
 
+def to_linear(rgb: np.ndarray) -> np.ndarray:
+    """Convert display-referred sRGB values to linear light."""
+    rgb = np.clip(rgb, 0, 1)
+    return np.where(
+        rgb <= 0.04045,
+        rgb / 12.92,
+        ((rgb + 0.055) / 1.055) ** 2.4,
+    )
+
+
+def to_srgb(linear: np.ndarray) -> np.ndarray:
+    """Convert linear-light RGB values back to display-referred sRGB."""
+    linear = np.clip(linear, 0, 1)
+    return np.where(
+        linear <= 0.0031308,
+        linear * 12.92,
+        1.055 * np.power(linear, 1.0 / 2.4) - 0.055,
+    )
+
+
+def _srgb_scalar_to_linear(v: float) -> float:
+    if v <= 0.04045:
+        return v / 12.92
+    return ((v + 0.055) / 1.055) ** 2.4
+
+
+def enc_curve(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Author tone-curve control points in display-encoded (sRGB) space.
+
+    The filmic engine applies tone curves to LINEAR luminance, where encoded
+    intuition is badly wrong — "whites settle at 0.93" in linear is encoded
+    0.97 (paper white), and an encoded-thinking S-curve collapses to near
+    identity. This converts encoded (in, out) pairs to the linear pairs the
+    engine expects, so curves do what their authors meant. ALWAYS wrap color
+    stock tone_curves in this.
+    """
+    return [(_srgb_scalar_to_linear(a), _srgb_scalar_to_linear(b)) for a, b in points]
+
+
 # ---------------------------------------------------------------------------
-# Digital sim helpers (kept for Fuji digital modes)
+# Tone curve & color helpers
 # ---------------------------------------------------------------------------
 
 HUE_RANGES = {
@@ -133,6 +168,12 @@ def _spline_curve(x: np.ndarray, points: list[tuple[float, float]]) -> np.ndarra
     xs = [p[0] for p in points]
     ys = [p[1] for p in points]
     return np.clip(np.interp(x, xs, ys), 0, 1)
+
+
+def _smoothstep(edge0: float, edge1: float, x: np.ndarray) -> np.ndarray:
+    """Hermite smooth interpolation between two edges."""
+    t = np.clip((x - edge0) / max(edge1 - edge0, 1e-6), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
 
 
 def apply_saturation(
@@ -187,197 +228,131 @@ def apply_split_tone(
     return np.clip(out, 0, 1)
 
 
-# ---------------------------------------------------------------------------
-# Physical film emulsion model
-# ---------------------------------------------------------------------------
-
-def hd_curve(log_h, d_min, d_max, gamma, speed, toe=1.0, shoulder=1.0):
-    """
-    Parametric H&D (Hurter-Driffield) characteristic curve.
-
-    Models the sensitometric response of film emulsion as an asymmetric sigmoid
-    in log-exposure / density space.
-
-    Parameters:
-        log_h:     log10(exposure) values
-        d_min:     fog level (minimum density)
-        d_max:     maximum density
-        gamma:     contrast (slope of linear portion)
-        speed:     film speed (horizontal position of curve)
-        toe:       shadow rolloff sharpness (lower = softer toe)
-        shoulder:  highlight rolloff sharpness (lower = softer shoulder)
-
-    Returns:
-        density values
-    """
-    x = (log_h - speed) * gamma
-    k = np.where(x < 0, toe * x, shoulder * x)
-    sigmoid = 1.0 / (1.0 + np.exp(-k))
-    return d_min + (d_max - d_min) * sigmoid
+def apply_luminance_saturation(
+    rgb: np.ndarray,
+    lum: np.ndarray,
+    shadow_amount: float = 0.0,
+    highlight_amount: float = 0.0,
+    midtone_boost: float = 0.0,
+    shadow_end: float = 0.42,
+    highlight_start: float = 0.58,
+) -> np.ndarray:
+    """Adjust saturation by tonal region in linear light."""
+    out = rgb.copy()
+    shadow_w = 1.0 - _smoothstep(0.0, shadow_end, lum)
+    highlight_w = _smoothstep(highlight_start, 1.0, lum)
+    mid_w = np.clip(1.0 - shadow_w - highlight_w, 0.0, 1.0)
+    sat = 1.0 - shadow_w * shadow_amount - highlight_w * highlight_amount + mid_w * midtone_boost
+    sat = np.clip(sat, 0.0, 2.0)
+    gray = lum[:, None]
+    return np.clip(gray + (out - gray) * sat[:, None], 0, 1)
 
 
-def hd_curve_reversal(log_h, d_min, d_max, gamma, speed, toe=1.0, shoulder=1.0):
-    """Reversal (slide) film H&D curve — high exposure = low density."""
-    return d_min + d_max - hd_curve(log_h, d_min, d_max, gamma, speed, toe, shoulder)
+def apply_filmic_color(lut: np.ndarray, params: dict) -> np.ndarray:
+    """Luminance-aware film emulation authored in linear light."""
+    out = to_linear(lut)
 
+    luma_weights = np.array(params.get("luma_weights", (0.2126, 0.7152, 0.0722)))
+    lum = np.clip(out @ luma_weights, 0.0, 1.0)
 
-def percentile_normalize(channel, lo_pct=0.5, hi_pct=99.5):
-    """Normalize channel to [0,1] using percentiles (like enlarger exposure adjustment)."""
-    lo = np.percentile(channel, lo_pct)
-    hi = np.percentile(channel, hi_pct)
-    if hi - lo < 1e-10:
-        return np.clip(channel, 0, 1)
-    return np.clip((channel - lo) / (hi - lo), 0, 1)
+    tone_curve = params["tone_curve"]
+    tone = _spline_curve(lum, tone_curve)
+    density = np.divide(tone, np.maximum(lum, 1e-5))
+    density_amount = params.get("density_amount", 1.0)
+    density = 1.0 + (density - 1.0) * density_amount
+    out *= density[:, None]
 
+    mid = params.get("midpoint", 0.5)
+    shadow_w = 1.0 - _smoothstep(mid * 0.35, mid, lum)
+    shadow_floor = _smoothstep(params.get("shadow_floor_start", 0.02), params.get("shadow_floor_end", 0.14), lum)
+    shadow_w *= shadow_floor
+    highlight_w = _smoothstep(mid, 1.0, lum)
 
-# ---------------------------------------------------------------------------
-# Processing pipeline helpers
-# ---------------------------------------------------------------------------
+    shadow_tint = np.array(params.get("shadow_tint", (0.0, 0.0, 0.0)))
+    highlight_tint = np.array(params.get("highlight_tint", (0.0, 0.0, 0.0)))
+    out += shadow_w[:, None] * shadow_tint[None, :]
+    out += highlight_w[:, None] * highlight_tint[None, :]
 
-LOG_FLOOR = 1e-6
-
-
-def _apply_hd_per_channel(log_h, channel_params, curve_fn=hd_curve):
-    """Apply H&D curve per-channel using parameter dicts for R, G, B."""
-    out = np.empty_like(log_h)
-    for ch, p in enumerate(channel_params):
-        out[:, ch] = curve_fn(
-            log_h[:, ch], p["d_min"], p["d_max"], p["gamma"],
-            p["speed"], p.get("toe", 1.0), p.get("shoulder", 1.0),
-        )
-    return out
-
-
-def _apply_hd_single(log_h, p, curve_fn=hd_curve):
-    """Apply H&D curve using a single parameter dict."""
-    return curve_fn(
-        log_h, p["d_min"], p["d_max"], p["gamma"],
-        p["speed"], p.get("toe", 1.0), p.get("shoulder", 1.0),
+    out = apply_luminance_saturation(
+        out,
+        np.clip(out @ luma_weights, 0.0, 1.0),
+        shadow_amount=params.get("shadow_desat", 0.0),
+        highlight_amount=params.get("highlight_desat", 0.0),
+        midtone_boost=params.get("midtone_sat_boost", 0.0),
+        shadow_end=params.get("shadow_end", 0.42),
+        highlight_start=params.get("highlight_start", 0.58),
     )
 
+    coupling = params.get("coupling")
+    if coupling:
+        mix_amt = coupling.get("amount", 0.0)
+        if mix_amt > 0:
+            matrix = np.array(coupling["matrix"])
+            mixed = out @ matrix.T
+            out = out * (1.0 - mix_amt) + mixed * mix_amt
 
-def _apply_dir_coupler(density, strength):
-    """DIR coupler: exposure-dependent cross-channel saturation boost."""
-    if strength > 0:
-        mean_density = np.mean(density, axis=1, keepdims=True)
-        density = density + strength * (density - mean_density)
-    return density
+    out = np.clip(to_srgb(out), 0, 1)
 
+    # Lifted-black toe (film-base floor). The multiplicative `density` above
+    # SHAPES the toe but cannot raise a mathematical zero (0 * density == 0), so
+    # a stock without a split_tone clips to pure black at input (0,0,0) even
+    # though its tone_curve promises a lifted toe. This restores the floor those
+    # curves imply ("blacks ~0.02-0.05"). Applied in display space so the values
+    # match the target directly; strongest at true black, faded out through the
+    # deep shadows by `black_lift_end`. Default is None -> exact no-op, so stocks
+    # that already carry a present toe (via split_tone) are untouched.
+    black_lift = params.get("black_lift")
+    if black_lift is not None:
+        lift = np.atleast_1d(np.asarray(black_lift, dtype=np.float64))
+        if lift.size == 1:
+            lift = np.repeat(lift, 3)
+        srgb_lum = np.clip(out @ luma_weights, 0.0, 1.0)
+        lift_end = params.get("black_lift_end", 0.06)
+        w = 1.0 - _smoothstep(0.0, lift_end, srgb_lum)
+        out = out + w[:, None] * lift[None, :]
 
-def _density_to_transmittance(density):
-    """Beer-Lambert law: T = 10^(-D)."""
-    return np.power(10.0, -density)
-
-
-def _normalize_channels(data):
-    """Percentile-normalize each channel of an (N,3) array to [0,1]."""
-    out = np.empty_like(data)
-    for ch in range(3):
-        out[:, ch] = percentile_normalize(data[:, ch])
-    return out
-
-
-def _print_stage(transmittance, print_params):
-    """Print paper stage: transmittance → print H&D → reflectance."""
-    print_log = np.log10(np.clip(transmittance, LOG_FLOOR, None))
-    if print_log.ndim == 1:
-        print_density = _apply_hd_single(print_log, print_params)
-    else:
-        print_density = np.empty_like(print_log)
-        for ch in range(3):
-            print_density[:, ch] = _apply_hd_single(print_log[:, ch], print_params)
-    return _density_to_transmittance(print_density)
+    return np.clip(out, 0, 1)
 
 
 # ---------------------------------------------------------------------------
 # Processing pipelines
 # ---------------------------------------------------------------------------
 
-def process_color_negative(lut, params):
+def process_color(lut, params):
     """
-    Color negative film pipeline:
-    Input RGB [0,1] → log10(exposure) → per-channel H&D curves → negative density
-    → subtract orange mask → DIR coupler cross-channel boost
-    → transmittance (Beer-Lambert) → log10(transmittance)
-    → print paper H&D curves → print density → reflectance → normalize → [0,1]
+    Color film simulation pipeline.
+
+    Two mutually exclusive paths:
+      - filmic_color present -> terminal linear-light film engine. It owns the
+        full render; any per-hue saturation / hue shift / split-tone seasoning
+        lives INSIDE the filmic_color dict so it is explicit and never stacks
+        with the legacy keys by accident.
+      - otherwise -> legacy path: per-channel tone curves -> saturation/hue ->
+        split toning. Kept only for stocks not yet migrated to the filmic engine.
     """
-    orange_mask = params.get("orange_mask", (0.0, 0.0, 0.0))
+    out = lut.copy()
 
-    log_h = np.log10(np.clip(lut, LOG_FLOOR, 1.0))
-    neg_density = _apply_hd_per_channel(
-        log_h, [params["r"], params["g"], params["b"]],
-    )
+    if "filmic_color" in params:
+        fc = params["filmic_color"]
+        out = apply_filmic_color(out, fc)
+        # Display-referred seasoning, contained in the filmic dict.
+        if "saturation" in fc:
+            sat = fc["saturation"]
+            out = apply_saturation(out, global_sat=sat.get("global", 1.0), per_hue=sat.get("per_hue"))
+        if "hue_shift" in fc:
+            out = apply_hue_shift(out, fc["hue_shift"])
+        if "split_tone" in fc:
+            st = fc["split_tone"]
+            out = apply_split_tone(
+                out,
+                shadow_color=st["shadow_color"],
+                highlight_color=st["highlight_color"],
+                shadow_strength=st.get("shadow_strength", 0.15),
+                highlight_strength=st.get("highlight_strength", 0.10),
+            )
+        return np.clip(out, 0, 1)
 
-    # Subtract orange mask (compensates for dye crossover in color negatives)
-    neg_density -= np.array(orange_mask)
-    neg_density = np.maximum(neg_density, 0.0)
-
-    neg_density = _apply_dir_coupler(neg_density, params.get("dir_strength", 0.0))
-    transmittance = _density_to_transmittance(neg_density)
-    reflectance = _print_stage(transmittance, params["print"])
-
-    return _normalize_channels(reflectance)
-
-
-def process_slide(lut, params):
-    """
-    Slide / reversal film pipeline:
-    Input RGB [0,1] → log10(exposure) → per-channel reversal H&D curves
-    → DIR coupler boost → transmittance → normalize → [0,1]
-    """
-    log_h = np.log10(np.clip(lut, LOG_FLOOR, 1.0))
-    density = _apply_hd_per_channel(
-        log_h, [params["r"], params["g"], params["b"]],
-        curve_fn=hd_curve_reversal,
-    )
-
-    density = _apply_dir_coupler(density, params.get("dir_strength", 0.0))
-    transmittance = _density_to_transmittance(density)
-
-    return _normalize_channels(transmittance)
-
-
-def process_bw(lut, params):
-    """
-    B&W film pipeline:
-    Input RGB → weighted luminance → log10(lum) → negative H&D curve
-    → transmittance → print paper H&D curve → reflectance → normalize
-    → optional tint → [0,1]
-    """
-    weights = params["weights"]
-    tint = params.get("tint", None)
-
-    lum = weights[0] * lut[:, 0] + weights[1] * lut[:, 1] + weights[2] * lut[:, 2]
-    lum = np.clip(lum, LOG_FLOOR, None)
-
-    log_h = np.log10(lum)
-    neg_density = _apply_hd_single(log_h, params["negative"])
-    transmittance = _density_to_transmittance(neg_density)
-    reflectance = _print_stage(transmittance, params["print"])
-    reflectance = percentile_normalize(reflectance)
-
-    if tint:
-        out = np.stack([reflectance * t for t in tint], axis=-1)
-    else:
-        out = np.stack([reflectance, reflectance, reflectance], axis=-1)
-
-    return np.clip(out, 0, 1)
-
-
-def process_digital(lut, params):
-    """
-    Digital simulation pipeline (Fuji digital processing modes):
-    Input RGB → log10 → normalize to [0,1] → per-channel tone curves
-    → saturation/hue/split-tone adjustments → [0,1]
-
-    Working in log space gives more filmic rolloff than raw RGB curves.
-    """
-    # Work in log space for filmic rolloff
-    log_rgb = np.log10(np.clip(lut, LOG_FLOOR, 1.0))
-    # Normalize log values to [0,1] range
-    log_min = np.log10(LOG_FLOOR)
-    out = (log_rgb - log_min) / (0.0 - log_min)
-    out = np.clip(out, 0, 1)
+    # --- Legacy path (not-yet-migrated stocks) ---
 
     # Per-channel tone curves
     if "r_curve" in params:
@@ -415,66 +390,525 @@ def process_digital(lut, params):
     return np.clip(out, 0, 1)
 
 
+def process_bw(lut, params):
+    """
+    B&W film simulation pipeline:
+    RGB -> weighted luminance -> tone curve -> optional tint
+    """
+    weights = params["weights"]
+    tint = params.get("tint", None)
+
+    lum = weights[0] * lut[:, 0] + weights[1] * lut[:, 1] + weights[2] * lut[:, 2]
+
+    # Tone curve
+    if "curve" in params:
+        lum = _spline_curve(lum, params["curve"])
+
+    if tint:
+        out = np.stack([lum * t for t in tint], axis=-1)
+    else:
+        out = np.stack([lum, lum, lum], axis=-1)
+
+    return np.clip(out, 0, 1)
+
+
 # ---------------------------------------------------------------------------
-# Film stock parameter definitions
+# Film stock definitions — per-channel tone curves + color adjustments
+#
+# Curves are (input, output) control points in [0,1].
+# All presets target full dynamic range: blacks ~0.02-0.05, whites ~0.94-0.98.
 # ---------------------------------------------------------------------------
 
-# === Color Negatives ===
+# === Kodak Color Negative ===
 
 PORTRA_400 = {
-    "type": "color_negative",
-    "r": {"d_min": 0.20, "d_max": 2.4, "gamma": 0.55, "speed": -0.50, "toe": 0.8, "shoulder": 0.7},
-    "g": {"d_min": 0.18, "d_max": 2.5, "gamma": 0.55, "speed": -0.48, "toe": 0.8, "shoulder": 0.7},
-    "b": {"d_min": 0.16, "d_max": 2.6, "gamma": 0.55, "speed": -0.45, "toe": 0.8, "shoulder": 0.7},
-    "orange_mask": (0.15, 0.08, 0.0),
-    "dir_strength": 0.15,
-    "print": {"d_min": 0.04, "d_max": 1.9, "gamma": 2.2, "speed": -0.55, "toe": 1.1, "shoulder": 0.85},
+    "type": "color",
+    # Portra: warm, creamy, slightly desaturated skin tones
+    # Soft S-curve, lifted blacks, gentle highlight rolloff
+    "r_curve": [
+        (0.0, 0.035), (0.05, 0.07), (0.15, 0.17), (0.30, 0.34),
+        (0.50, 0.55), (0.70, 0.73), (0.85, 0.86), (0.95, 0.94), (1.0, 0.97),
+    ],
+    "g_curve": [
+        (0.0, 0.03), (0.05, 0.06), (0.15, 0.15), (0.30, 0.31),
+        (0.50, 0.51), (0.70, 0.70), (0.85, 0.83), (0.95, 0.92), (1.0, 0.95),
+    ],
+    "b_curve": [
+        (0.0, 0.025), (0.05, 0.05), (0.15, 0.13), (0.30, 0.27),
+        (0.50, 0.46), (0.70, 0.64), (0.85, 0.78), (0.95, 0.88), (1.0, 0.92),
+    ],
+    "saturation": {
+        "global": 0.92,
+        "per_hue": {
+            "red": 0.80, "red2": 0.80, "orange": 0.85,
+            "green": 1.05, "blue": 1.02, "cyan": 0.95,
+        },
+    },
+    "hue_shift": {"orange": 0.008, "yellow": 0.01},
+    "split_tone": {
+        "shadow_color": (0.30, 0.22, 0.14),
+        "highlight_color": (1.0, 0.97, 0.90),
+        "shadow_strength": 0.12,
+        "highlight_strength": 0.06,
+    },
 }
 
 EKTAR_100 = {
-    "type": "color_negative",
-    "r": {"d_min": 0.15, "d_max": 2.8, "gamma": 0.65, "speed": -0.55, "toe": 1.0, "shoulder": 0.85},
-    "g": {"d_min": 0.12, "d_max": 2.9, "gamma": 0.65, "speed": -0.52, "toe": 1.0, "shoulder": 0.85},
-    "b": {"d_min": 0.10, "d_max": 3.0, "gamma": 0.65, "speed": -0.50, "toe": 1.0, "shoulder": 0.85},
-    "orange_mask": (0.12, 0.06, 0.0),
-    "dir_strength": 0.35,
-    "print": {"d_min": 0.04, "d_max": 2.1, "gamma": 2.5, "speed": -0.60, "toe": 1.2, "shoulder": 0.9},
+    "type": "color",
+    # Ektar: vivid, punchy, saturated — landscape/product film
+    # Steep S-curve, deep blacks, strong color
+    "r_curve": [
+        (0.0, 0.01), (0.05, 0.03), (0.12, 0.09), (0.25, 0.22),
+        (0.50, 0.54), (0.70, 0.76), (0.85, 0.90), (0.95, 0.96), (1.0, 0.98),
+    ],
+    "g_curve": [
+        (0.0, 0.01), (0.05, 0.03), (0.12, 0.08), (0.25, 0.21),
+        (0.50, 0.52), (0.70, 0.74), (0.85, 0.88), (0.95, 0.95), (1.0, 0.97),
+    ],
+    "b_curve": [
+        (0.0, 0.01), (0.05, 0.02), (0.12, 0.07), (0.25, 0.19),
+        (0.50, 0.48), (0.70, 0.70), (0.85, 0.85), (0.95, 0.93), (1.0, 0.96),
+    ],
+    "saturation": {
+        "global": 1.25,
+        "per_hue": {
+            "red": 1.10, "red2": 1.10, "orange": 1.08,
+            "green": 1.20, "blue": 1.15, "cyan": 1.10, "yellow": 1.12,
+        },
+    },
+    "split_tone": {
+        "shadow_color": (0.22, 0.16, 0.10),
+        "highlight_color": (1.0, 0.98, 0.93),
+        "shadow_strength": 0.08,
+        "highlight_strength": 0.04,
+    },
 }
 
 GOLD_200 = {
-    "type": "color_negative",
-    "r": {"d_min": 0.22, "d_max": 2.3, "gamma": 0.58, "speed": -0.48, "toe": 0.9, "shoulder": 0.75},
-    "g": {"d_min": 0.20, "d_max": 2.4, "gamma": 0.58, "speed": -0.46, "toe": 0.9, "shoulder": 0.75},
-    "b": {"d_min": 0.18, "d_max": 2.1, "gamma": 0.52, "speed": -0.38, "toe": 0.85, "shoulder": 0.70},
-    "orange_mask": (0.20, 0.12, 0.0),
-    "dir_strength": 0.20,
-    "print": {"d_min": 0.04, "d_max": 2.0, "gamma": 2.3, "speed": -0.55, "toe": 1.1, "shoulder": 0.85},
+    "type": "color",
+    # Gold: warm amber consumer stock, nostalgic, less dynamic range
+    # Strong warm cast, lifted blacks, compressed highlights
+    "r_curve": [
+        (0.0, 0.05), (0.05, 0.09), (0.15, 0.19), (0.30, 0.36),
+        (0.50, 0.56), (0.70, 0.73), (0.85, 0.85), (0.95, 0.92), (1.0, 0.95),
+    ],
+    "g_curve": [
+        (0.0, 0.04), (0.05, 0.07), (0.15, 0.16), (0.30, 0.32),
+        (0.50, 0.51), (0.70, 0.68), (0.85, 0.81), (0.95, 0.89), (1.0, 0.93),
+    ],
+    "b_curve": [
+        (0.0, 0.03), (0.05, 0.05), (0.15, 0.11), (0.30, 0.23),
+        (0.50, 0.40), (0.70, 0.56), (0.85, 0.70), (0.95, 0.82), (1.0, 0.87),
+    ],
+    "saturation": {
+        "global": 1.00,
+        "per_hue": {
+            "red": 0.95, "orange": 1.05, "yellow": 1.15,
+            "green": 1.08, "blue": 0.85, "cyan": 0.88,
+        },
+    },
+    "hue_shift": {"orange": 0.01, "yellow": 0.015},
+    "split_tone": {
+        "shadow_color": (0.32, 0.24, 0.14),
+        "highlight_color": (1.0, 0.95, 0.82),
+        "shadow_strength": 0.15,
+        "highlight_strength": 0.08,
+    },
 }
 
-# === Slide / Reversal Films ===
+# === Fuji Slide / Reversal ===
 
 VELVIA = {
-    "type": "slide",
-    "r": {"d_min": 0.08, "d_max": 3.6, "gamma": 2.0, "speed": -0.40, "toe": 1.3, "shoulder": 1.1},
-    "g": {"d_min": 0.06, "d_max": 3.6, "gamma": 2.0, "speed": -0.38, "toe": 1.3, "shoulder": 1.1},
-    "b": {"d_min": 0.08, "d_max": 3.5, "gamma": 1.95, "speed": -0.42, "toe": 1.3, "shoulder": 1.1},
-    "dir_strength": 0.40,
+    "type": "color",
+    # Velvia: the landscape film. Extreme saturation and high contrast, but the
+    # punch comes from density + tonal saturation + channel coupling, not a flat
+    # HSL multiply. Highlights stay saturated longer than other stocks.
+    "filmic_color": {
+        # Hard slide-film S: crushed toe, fast mids, firm shoulder.
+        "tone_curve": enc_curve([
+            (0.0, 0.008), (0.06, 0.035), (0.18, 0.125), (0.35, 0.295),
+            (0.50, 0.52), (0.68, 0.75), (0.82, 0.885), (0.93, 0.945), (1.0, 0.965),
+        ]),
+        "density_amount": 1.0,
+        "midpoint": 0.50,
+        "shadow_tint": (0.0, 0.0, 0.003),
+        "highlight_tint": (0.004, 0.002, 0.004),
+        "shadow_floor_start": 0.03,
+        "shadow_floor_end": 0.16,
+        # Deepest present toe in the set — Velvia's crushed slide toe, lifted just
+        # off pure black so it reads as film base, not a clipped digital zero.
+        "black_lift": (0.011, 0.009, 0.014),
+        "shadow_desat": 0.05,
+        "highlight_desat": 0.06,
+        "midtone_sat_boost": 0.22,
+        "shadow_end": 0.20,
+        "highlight_start": 0.80,
+        "coupling": {
+            "amount": 0.06,
+            "matrix": [
+                [1.030, -0.015, -0.015],
+                [-0.012, 1.025, -0.013],
+                [-0.013, -0.012, 1.025],
+            ],
+        },
+        "saturation": {
+            "global": 1.12,
+            "per_hue": {
+                "red": 1.00, "red2": 1.00, "orange": 1.02,
+                "green": 1.14, "blue": 1.12, "cyan": 1.10, "yellow": 1.04,
+            },
+        },
+        "hue_shift": {"green": 0.008, "cyan": 0.006, "blue": -0.004},
+    },
 }
 
 PROVIA = {
-    "type": "slide",
-    "r": {"d_min": 0.08, "d_max": 3.2, "gamma": 1.7, "speed": -0.42, "toe": 1.1, "shoulder": 1.0},
-    "g": {"d_min": 0.06, "d_max": 3.2, "gamma": 1.7, "speed": -0.40, "toe": 1.1, "shoulder": 1.0},
-    "b": {"d_min": 0.08, "d_max": 3.1, "gamma": 1.65, "speed": -0.44, "toe": 1.1, "shoulder": 1.0},
-    "dir_strength": 0.20,
+    "type": "color",
+    # Provia: neutral, balanced general-purpose slide film. The reference look —
+    # honest contrast, a clean shoulder, a touch of pop that leans nowhere.
+    "filmic_color": {
+        # Honest general-purpose S: real toe, gentle pop, clean shoulder.
+        "tone_curve": enc_curve([
+            (0.0, 0.015), (0.06, 0.045), (0.18, 0.145), (0.35, 0.315),
+            (0.50, 0.51), (0.68, 0.725), (0.82, 0.86), (0.93, 0.93), (1.0, 0.955),
+        ]),
+        "density_amount": 0.95,
+        "midpoint": 0.50,
+        "shadow_tint": (0.0, 0.0, 0.0),
+        "highlight_tint": (0.004, 0.002, 0.006),
+        "shadow_floor_start": 0.04,
+        "shadow_floor_end": 0.18,
+        # Real, present toe for the neutral reference slide — deeper than the
+        # negatives but no longer clipped to zero.
+        "black_lift": (0.017, 0.013, 0.020),
+        "shadow_desat": 0.06,
+        "highlight_desat": 0.10,
+        "midtone_sat_boost": 0.10,
+        "shadow_end": 0.22,
+        "highlight_start": 0.74,
+        "coupling": {
+            "amount": 0.03,
+            "matrix": [
+                [1.012, 0.004, -0.016],
+                [0.004, 1.006, -0.010],
+                [-0.008, 0.006, 1.002],
+            ],
+        },
+        "saturation": {
+            "global": 1.05,
+            "per_hue": {"green": 1.06, "blue": 1.04, "cyan": 1.04},
+        },
+    },
 }
 
 ASTIA = {
-    "type": "slide",
-    "r": {"d_min": 0.10, "d_max": 3.0, "gamma": 1.5, "speed": -0.44, "toe": 0.95, "shoulder": 0.9},
-    "g": {"d_min": 0.08, "d_max": 3.0, "gamma": 1.5, "speed": -0.42, "toe": 0.95, "shoulder": 0.9},
-    "b": {"d_min": 0.10, "d_max": 2.9, "gamma": 1.45, "speed": -0.46, "toe": 0.95, "shoulder": 0.9},
-    "dir_strength": 0.12,
+    "type": "color",
+    # Astia: soft, flattering portrait slide film. Lifted toe for milky blacks,
+    # strong highlight desaturation for creamy rolloff, protected skin tones.
+    "filmic_color": {
+        # Soft S: milky lifted toe, gentle mids, creamy early shoulder.
+        "tone_curve": enc_curve([
+            (0.0, 0.025), (0.06, 0.06), (0.18, 0.16), (0.35, 0.33),
+            (0.50, 0.505), (0.68, 0.705), (0.82, 0.84), (0.93, 0.91), (1.0, 0.94),
+        ]),
+        "density_amount": 0.85,
+        "midpoint": 0.52,
+        "shadow_tint": (0.004, 0.003, 0.004),
+        "highlight_tint": (0.012, 0.006, 0.0),
+        "shadow_floor_start": 0.06,
+        "shadow_floor_end": 0.22,
+        # Milky lifted blacks are Astia's stated identity — highest slide floor,
+        # a soft warm-neutral so shadows read creamy rather than crushed.
+        "black_lift": (0.026, 0.021, 0.030),
+        "black_lift_end": 0.09,
+        "shadow_desat": 0.04,
+        "highlight_desat": 0.16,
+        "midtone_sat_boost": 0.06,
+        "shadow_end": 0.24,
+        "highlight_start": 0.72,
+        "coupling": {
+            "amount": 0.03,
+            "matrix": [
+                [1.010, 0.006, -0.016],
+                [0.004, 1.004, -0.008],
+                [-0.006, 0.006, 1.000],
+            ],
+        },
+        "saturation": {
+            "global": 1.00,
+            "per_hue": {"red": 0.90, "red2": 0.90, "orange": 0.92, "green": 1.04},
+        },
+    },
+}
+
+# === Fuji Digital Simulations ===
+
+CLASSIC_CHROME = {
+    "type": "color",
+    # Classic Chrome: muted, earthy documentary/street look. Heavy shadow
+    # desaturation, warm earthy shadow tint, greens/cyans pulled way down. The
+    # desaturation is the identity — shadow_desat does the tonal work, the
+    # nested global/per-hue does the rest.
+    "filmic_color": {
+        # Documentary S: deep shadows, punchy low-mids, restrained highlights.
+        "tone_curve": enc_curve([
+            (0.0, 0.012), (0.06, 0.038), (0.18, 0.13), (0.35, 0.305),
+            (0.50, 0.515), (0.68, 0.73), (0.82, 0.855), (0.93, 0.92), (1.0, 0.945),
+        ]),
+        "density_amount": 0.95,
+        "midpoint": 0.55,
+        "shadow_tint": (0.012, 0.006, -0.004),
+        "highlight_tint": (0.006, 0.002, -0.004),
+        "shadow_floor_start": 0.05,
+        "shadow_floor_end": 0.22,
+        "shadow_desat": 0.18,
+        "highlight_desat": 0.10,
+        "midtone_sat_boost": 0.0,
+        "shadow_end": 0.26,
+        "highlight_start": 0.74,
+        "coupling": {
+            "amount": 0.05,
+            "matrix": [
+                [1.018, 0.014, -0.032],
+                [0.010, 1.000, -0.010],
+                [-0.012, 0.020, 0.992],
+            ],
+        },
+        "saturation": {
+            "global": 0.72,
+            "per_hue": {
+                "green": 0.58, "yellow": 0.66, "orange": 0.85,
+                "cyan": 0.62, "blue": 0.78,
+            },
+        },
+        "hue_shift": {"orange": 0.012, "yellow": 0.018, "green": 0.02},
+        "split_tone": {
+            "shadow_color": (0.28, 0.20, 0.12),
+            "highlight_color": (1.0, 0.96, 0.88),
+            "shadow_strength": 0.16,
+            "highlight_strength": 0.06,
+        },
+    },
+}
+
+CLASSIC_NEG = {
+    "type": "color",
+    # Classic Neg: denser contrast, richer mids, warm highlights and cooler shadows.
+    # Tuned 2026-06 against a community recipe + reference frames (WB 5100K
+    # R2/B-2, Tone H-2 S-2, Color +4, Chrome FX Blue strong): warm creamy
+    # whites baked in, olive-shifted greens, dusty dense blues, soft shoulder.
+    "filmic_color": {
+        # Shoulder lands below 1.0 so the warm highlight_tint can't push a
+        # channel into a hard clip — the rolloff is the whole point of the look.
+        # Matte contrast: the punch lives in the crushed toe; upper mids and
+        # highlights sit AT or BELOW identity (H-2). Pushing 0.6–0.85 up would
+        # shove sunlit skin into the flat shoulder and erase its texture.
+        "tone_curve": enc_curve([
+            (0.0, 0.015), (0.06, 0.04), (0.18, 0.13), (0.35, 0.315),
+            (0.50, 0.525), (0.68, 0.705), (0.82, 0.815), (0.93, 0.895), (1.0, 0.925),
+        ]),
+        "density_amount": 0.95,
+        "midpoint": 0.60,
+        # Cool-teal shadows vs warm cream highlights — the recipe's R+2/B-2
+        # on a warm WB reads as this split, so it lives in the LUT.
+        "shadow_tint": (-0.006, 0.002, 0.006),
+        "highlight_tint": (0.020, 0.006, -0.008),
+        "shadow_floor_start": 0.10,
+        "shadow_floor_end": 0.26,
+        "shadow_desat": 0.03,
+        "highlight_desat": 0.03,
+        "midtone_sat_boost": 0.03,
+        "shadow_end": 0.24,
+        "highlight_start": 0.76,
+        "coupling": {
+            "amount": 0.04,
+            "matrix": [
+                [1.015, 0.010, -0.015],
+                [0.006, 1.00, -0.006],
+                [-0.010, 0.015, 0.995],
+            ],
+        },
+        # Seasoning is nested here, not at the top level, so it stays part of
+        # the filmic render and never stacks via the legacy keys.
+        # Color +4 richness carried by mids/reds; greens go muted-olive,
+        # blues/cyans dusty-dense (the Chrome FX Blue read).
+        "saturation": {
+            "global": 1.05,
+            "per_hue": {
+                "green": 0.80, "yellow": 0.90, "red": 1.03, "red2": 1.03,
+                "orange": 1.03, "cyan": 0.85, "blue": 0.86,
+            },
+        },
+        "hue_shift": {"green": 0.032, "yellow": 0.010, "orange": 0.004, "cyan": 0.012, "blue": 0.006},
+        # Global warm cast (the fixed 5100K feel): cream highlights, cool
+        # slate shadows.
+        "split_tone": {
+            "shadow_color": (0.22, 0.26, 0.32),
+            "highlight_color": (1.0, 0.95, 0.86),
+            "shadow_strength": 0.08,
+            "highlight_strength": 0.09,
+        },
+    },
+}
+
+PRO_NEG_HI = {
+    "type": "color",
+    # Pro Neg Hi: portrait negative — slightly warm, moderate contrast, clean
+    # skin. A restrained look that flatters faces without going muddy.
+    "filmic_color": {
+        # Portrait-negative S: moderate punch, flattering highlight ramp.
+        "tone_curve": enc_curve([
+            (0.0, 0.015), (0.06, 0.045), (0.18, 0.14), (0.35, 0.315),
+            (0.50, 0.515), (0.68, 0.73), (0.82, 0.855), (0.93, 0.92), (1.0, 0.95),
+        ]),
+        "density_amount": 0.90,
+        "midpoint": 0.52,
+        "shadow_tint": (0.006, 0.002, -0.002),
+        "highlight_tint": (0.008, 0.003, -0.002),
+        "shadow_floor_start": 0.05,
+        "shadow_floor_end": 0.20,
+        # Portrait negative: lifted toe in the 0.02 range, faintly warm to keep
+        # skin shadows clean rather than clipped.
+        "black_lift": (0.020, 0.015, 0.023),
+        "shadow_desat": 0.06,
+        "highlight_desat": 0.12,
+        "midtone_sat_boost": 0.06,
+        "shadow_end": 0.22,
+        "highlight_start": 0.74,
+        "coupling": {
+            "amount": 0.035,
+            "matrix": [
+                [1.014, 0.008, -0.022],
+                [0.006, 1.002, -0.008],
+                [-0.008, 0.008, 1.000],
+            ],
+        },
+        "saturation": {
+            "global": 1.02,
+            "per_hue": {"red": 1.03, "orange": 1.05, "yellow": 1.0},
+        },
+    },
+}
+
+PRO_NEG_STD = {
+    "type": "color",
+    # Pro Neg Std: low-contrast studio negative. Lifted blacks, compressed
+    # highlights, muted across the board — a soft, controlled base.
+    "filmic_color": {
+        # Soft studio S: lifted blacks, low mid contrast, early shoulder —
+        # but still a real curve, not flat.
+        "tone_curve": enc_curve([
+            (0.0, 0.025), (0.06, 0.062), (0.18, 0.165), (0.35, 0.335),
+            (0.50, 0.50), (0.68, 0.70), (0.82, 0.82), (0.93, 0.89), (1.0, 0.925),
+        ]),
+        "density_amount": 0.80,
+        "midpoint": 0.52,
+        "shadow_tint": (0.004, 0.003, 0.003),
+        "highlight_tint": (0.004, 0.003, 0.0),
+        "shadow_floor_start": 0.06,
+        "shadow_floor_end": 0.24,
+        # Low-contrast studio negative: its comment promises lifted blacks, so
+        # give it the highest negative floor (~0.03), soft and near-neutral.
+        "black_lift": (0.029, 0.024, 0.033),
+        "black_lift_end": 0.09,
+        "shadow_desat": 0.10,
+        "highlight_desat": 0.12,
+        "midtone_sat_boost": 0.0,
+        "shadow_end": 0.24,
+        "highlight_start": 0.72,
+        "coupling": {
+            "amount": 0.03,
+            "matrix": [
+                [1.010, 0.006, -0.016],
+                [0.004, 1.002, -0.006],
+                [-0.006, 0.006, 1.000],
+            ],
+        },
+        "saturation": {
+            "global": 0.80,
+            "per_hue": {"red": 0.90, "orange": 0.86, "yellow": 0.82, "green": 0.78},
+        },
+    },
+}
+
+ETERNA = {
+    "type": "color",
+    # Eterna: cinema stock, flat/log-like and desaturated with cool shadows.
+    # Low density, compressed highlights, mids pulled down a touch — the graded
+    # "footage" feel rather than a snapshot.
+    "filmic_color": {
+        # Cine log-ish S: raised toe, compressed shoulder, but enough mid
+        # slope that footage reads graded rather than undeveloped.
+        "tone_curve": enc_curve([
+            (0.0, 0.03), (0.06, 0.07), (0.18, 0.175), (0.35, 0.345),
+            (0.50, 0.495), (0.68, 0.665), (0.82, 0.785), (0.93, 0.865), (1.0, 0.90),
+        ]),
+        "density_amount": 0.85,
+        "midpoint": 0.50,
+        "shadow_tint": (-0.006, 0.0, 0.012),
+        "highlight_tint": (0.002, 0.002, 0.004),
+        "shadow_floor_start": 0.06,
+        "shadow_floor_end": 0.24,
+        "shadow_desat": 0.16,
+        "highlight_desat": 0.14,
+        "midtone_sat_boost": -0.04,
+        "shadow_end": 0.28,
+        "highlight_start": 0.70,
+        "coupling": {
+            "amount": 0.03,
+            "matrix": [
+                [1.006, 0.006, -0.012],
+                [0.004, 1.000, -0.004],
+                [-0.004, 0.008, 1.004],
+            ],
+        },
+        "saturation": {
+            "global": 0.58,
+            "per_hue": {"green": 0.78, "cyan": 0.82, "blue": 0.86, "orange": 0.90},
+        },
+        "split_tone": {
+            "shadow_color": (0.14, 0.16, 0.22),
+            "highlight_color": (0.97, 0.96, 0.93),
+            "shadow_strength": 0.10,
+            "highlight_strength": 0.04,
+        },
+    },
+}
+
+ETERNA_BLEACH_BYPASS = {
+    "type": "color",
+    # Eterna Bleach Bypass: high contrast, very desaturated, gritty. Steep
+    # curve, crushed toe, near-monochrome color with retained luminance contrast.
+    "filmic_color": {
+        # Steepest S in the set: crushed toe, hot highlights, gritty.
+        "tone_curve": enc_curve([
+            (0.0, 0.005), (0.06, 0.028), (0.18, 0.115), (0.35, 0.30),
+            (0.50, 0.545), (0.68, 0.775), (0.82, 0.895), (0.93, 0.95), (1.0, 0.975),
+        ]),
+        "density_amount": 1.0,
+        "midpoint": 0.50,
+        "shadow_tint": (0.002, 0.002, 0.004),
+        "highlight_tint": (0.004, 0.004, 0.004),
+        "shadow_floor_start": 0.04,
+        "shadow_floor_end": 0.16,
+        # Bleach bypass is gritty crushed-shadow by design — give it the
+        # smallest lift, just enough to clear pure-black clipping.
+        "black_lift": (0.009, 0.008, 0.010),
+        "shadow_desat": 0.20,
+        "highlight_desat": 0.18,
+        "midtone_sat_boost": -0.05,
+        "shadow_end": 0.24,
+        "highlight_start": 0.76,
+        "coupling": {
+            "amount": 0.02,
+            "matrix": [
+                [1.004, 0.004, -0.008],
+                [0.002, 1.000, -0.002],
+                [-0.004, 0.004, 1.000],
+            ],
+        },
+        "saturation": {"global": 0.34},
+    },
 }
 
 # === B&W Films ===
@@ -482,184 +916,79 @@ ASTIA = {
 ACROS = {
     "type": "bw",
     "weights": (0.25, 0.65, 0.10),
-    "negative": {"d_min": 0.08, "d_max": 2.8, "gamma": 0.68, "speed": -0.50, "toe": 1.0, "shoulder": 0.9},
-    "print": {"d_min": 0.04, "d_max": 2.2, "gamma": 2.8, "speed": -0.55, "toe": 1.3, "shoulder": 0.95},
+    # Acros: fine detail, moderate contrast, clean tones
+    "curve": [
+        (0.0, 0.01), (0.05, 0.03), (0.15, 0.12), (0.30, 0.28),
+        (0.50, 0.52), (0.70, 0.73), (0.85, 0.87), (0.95, 0.95), (1.0, 0.98),
+    ],
 }
 
 TRI_X_400 = {
     "type": "bw",
     "weights": (0.35, 0.55, 0.10),
-    "negative": {"d_min": 0.10, "d_max": 2.6, "gamma": 0.72, "speed": -0.48, "toe": 0.9, "shoulder": 0.85},
-    "print": {"d_min": 0.04, "d_max": 2.3, "gamma": 2.6, "speed": -0.55, "toe": 1.2, "shoulder": 0.9},
+    # Tri-X: gritty, high contrast, deep blacks, photojournalism
+    "curve": [
+        (0.0, 0.0), (0.03, 0.01), (0.10, 0.04), (0.20, 0.14),
+        (0.35, 0.32), (0.50, 0.55), (0.65, 0.74), (0.80, 0.88),
+        (0.90, 0.94), (0.95, 0.97), (1.0, 0.99),
+    ],
 }
 
 HP5_PLUS = {
     "type": "bw",
     "weights": (0.28, 0.62, 0.10),
-    "negative": {"d_min": 0.09, "d_max": 2.5, "gamma": 0.62, "speed": -0.48, "toe": 0.95, "shoulder": 0.85},
-    "print": {"d_min": 0.04, "d_max": 2.1, "gamma": 2.4, "speed": -0.55, "toe": 1.15, "shoulder": 0.9},
+    # HP5: versatile, moderate contrast, slightly softer than Tri-X
+    "curve": [
+        (0.0, 0.01), (0.05, 0.03), (0.15, 0.13), (0.30, 0.29),
+        (0.50, 0.52), (0.70, 0.72), (0.85, 0.86), (0.95, 0.94), (1.0, 0.97),
+    ],
 }
 
 DELTA_3200 = {
     "type": "bw",
     "weights": (0.24, 0.68, 0.08),
-    "negative": {"d_min": 0.15, "d_max": 2.2, "gamma": 0.48, "speed": -0.42, "toe": 0.8, "shoulder": 0.7},
-    "print": {"d_min": 0.05, "d_max": 1.8, "gamma": 2.0, "speed": -0.50, "toe": 1.0, "shoulder": 0.85},
+    # Delta 3200: pushed, low contrast, lifted shadows, dreamy
+    "curve": [
+        (0.0, 0.04), (0.05, 0.07), (0.15, 0.16), (0.30, 0.31),
+        (0.50, 0.50), (0.70, 0.68), (0.85, 0.82), (0.95, 0.91), (1.0, 0.95),
+    ],
 }
 
 MONOCHROME = {
     "type": "bw",
     "weights": (0.22, 0.70, 0.08),
-    "negative": {"d_min": 0.10, "d_max": 2.3, "gamma": 0.58, "speed": -0.48, "toe": 0.9, "shoulder": 0.8},
-    "print": {"d_min": 0.04, "d_max": 1.9, "gamma": 2.2, "speed": -0.52, "toe": 1.1, "shoulder": 0.85},
+    # Monochrome: clean, moderate
+    "curve": [
+        (0.0, 0.01), (0.05, 0.04), (0.15, 0.14), (0.30, 0.30),
+        (0.50, 0.51), (0.70, 0.71), (0.85, 0.85), (0.95, 0.94), (1.0, 0.97),
+    ],
 }
 
 SEPIA = {
     "type": "bw",
     "weights": (0.22, 0.70, 0.08),
-    "negative": {"d_min": 0.10, "d_max": 2.3, "gamma": 0.58, "speed": -0.48, "toe": 0.9, "shoulder": 0.8},
-    "print": {"d_min": 0.04, "d_max": 1.9, "gamma": 2.2, "speed": -0.52, "toe": 1.1, "shoulder": 0.85},
-    "tint": (1.10, 0.95, 0.75),
-}
-
-# === Digital Simulations (Fuji digital processing modes) ===
-
-CLASSIC_CHROME = {
-    "type": "digital",
     "curve": [
-        (0.0, 0.04), (0.10, 0.14), (0.25, 0.28), (0.5, 0.50),
-        (0.75, 0.71), (0.90, 0.84), (1.0, 0.94),
+        (0.0, 0.02), (0.05, 0.05), (0.15, 0.14), (0.30, 0.30),
+        (0.50, 0.51), (0.70, 0.71), (0.85, 0.85), (0.95, 0.94), (1.0, 0.97),
     ],
-    "saturation": {
-        "global": 0.75,
-        "per_hue": {"green": 0.6, "yellow": 0.7, "orange": 0.85, "cyan": 0.7},
-    },
-    "hue_shift": {"orange": 0.01, "yellow": 0.015},
-    "split_tone": {
-        "shadow_color": (0.25, 0.18, 0.10),
-        "highlight_color": (1.0, 0.97, 0.90),
-        "shadow_strength": 0.18,
-        "highlight_strength": 0.06,
-    },
+    "tint": (1.08, 0.94, 0.76),
 }
-
-CLASSIC_NEG = {
-    "type": "digital",
-    "curve": [
-        (0.0, 0.0), (0.08, 0.05), (0.20, 0.19), (0.35, 0.37),
-        (0.5, 0.53), (0.70, 0.68), (0.85, 0.81), (1.0, 0.92),
-    ],
-    "saturation": {
-        "global": 0.88,
-        "per_hue": {
-            "green": 0.55, "yellow": 0.65, "red": 1.25, "red2": 1.25,
-            "orange": 0.90, "cyan": 0.60,
-        },
-    },
-    "hue_shift": {"green": 0.03, "yellow": 0.02, "orange": 0.015},
-    "split_tone": {
-        "shadow_color": (0.22, 0.15, 0.10),
-        "highlight_color": (0.98, 0.95, 0.85),
-        "shadow_strength": 0.15,
-        "highlight_strength": 0.08,
-    },
-}
-
-PRO_NEG_HI = {
-    "type": "digital",
-    "curve": [
-        (0.0, 0.0), (0.10, 0.09), (0.25, 0.23), (0.5, 0.52),
-        (0.75, 0.78), (0.90, 0.91), (1.0, 1.0),
-    ],
-    "saturation": {
-        "global": 1.08,
-        "per_hue": {"red": 1.05, "orange": 1.10},
-    },
-    "split_tone": {
-        "shadow_color": (0.18, 0.14, 0.12),
-        "highlight_color": (1.0, 0.98, 0.94),
-        "shadow_strength": 0.06,
-        "highlight_strength": 0.04,
-    },
-}
-
-PRO_NEG_STD = {
-    "type": "digital",
-    "curve": [
-        (0.0, 0.04), (0.10, 0.13), (0.25, 0.28), (0.5, 0.50),
-        (0.75, 0.72), (0.90, 0.85), (1.0, 0.95),
-    ],
-    "saturation": {
-        "global": 0.72,
-        "per_hue": {"red": 0.90, "orange": 0.85, "yellow": 0.80, "green": 0.75},
-    },
-    "split_tone": {
-        "shadow_color": (0.16, 0.14, 0.15),
-        "highlight_color": (1.0, 0.99, 0.97),
-        "shadow_strength": 0.04,
-        "highlight_strength": 0.02,
-    },
-}
-
-ETERNA = {
-    "type": "digital",
-    "curve": [
-        (0.0, 0.06), (0.10, 0.14), (0.25, 0.29), (0.5, 0.49),
-        (0.75, 0.69), (0.90, 0.81), (1.0, 0.91),
-    ],
-    "saturation": {
-        "global": 0.60,
-        "per_hue": {"green": 0.80, "cyan": 0.85, "blue": 0.90},
-    },
-    "split_tone": {
-        "shadow_color": (0.14, 0.16, 0.20),
-        "highlight_color": (0.96, 0.95, 0.92),
-        "shadow_strength": 0.10,
-        "highlight_strength": 0.05,
-    },
-}
-
-ETERNA_BLEACH_BYPASS = {
-    "type": "digital",
-    "curve": [
-        (0.0, 0.0), (0.05, 0.01), (0.15, 0.07), (0.30, 0.23),
-        (0.5, 0.53), (0.70, 0.81), (0.85, 0.93), (0.95, 0.98), (1.0, 1.0),
-    ],
-    "saturation": {"global": 0.30},
-    "split_tone": {
-        "shadow_color": (0.12, 0.12, 0.14),
-        "highlight_color": (0.98, 0.97, 0.94),
-        "shadow_strength": 0.08,
-        "highlight_strength": 0.04,
-    },
-}
-
 
 # ---------------------------------------------------------------------------
 # Pipeline dispatcher
 # ---------------------------------------------------------------------------
 
 PIPELINES = {
-    "color_negative": process_color_negative,
-    "slide": process_slide,
+    "color": process_color,
     "bw": process_bw,
-    "digital": process_digital,
 }
-
-
-def generate_lut(base, params):
-    """Dispatch to the appropriate pipeline based on film type."""
-    pipeline = PIPELINES[params["type"]]
-    return pipeline(base.copy(), params)
-
 
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
 FILM_SIMS: list[tuple[str, str, dict]] = [
-    # (subdirectory, filename, parameters)
-    # Fuji - Color (slide)
+    # Fuji - Slide
     ("fuji", "Provia", PROVIA),
     ("fuji", "Velvia", VELVIA),
     ("fuji", "Astia", ASTIA),
@@ -686,17 +1015,58 @@ FILM_SIMS: list[tuple[str, str, dict]] = [
 ]
 
 
+def diagnose_lut(name: str, lut: np.ndarray):
+    """Print per-preset diagnostic stats for a generated LUT."""
+    n = lut.shape[0]
+    channels = ["R", "G", "B"]
+    clip_lo = np.sum(lut <= 0.001, axis=0)
+    clip_hi = np.sum(lut >= 0.999, axis=0)
+
+    size = LUT_SIZE
+    black_idx = 0
+    mid = size // 2
+    gray_idx = mid * size * size + mid * size + mid
+    white_idx = n - 1
+
+    print(f"\n{'='*60}")
+    print(f"  {name}")
+    print(f"{'='*60}")
+    print(f"  {'Chan':>4}   {'Min':>6}  {'Max':>6}  {'Mean':>6}  {'ClipLo':>7}  {'ClipHi':>7}")
+    for i, ch in enumerate(channels):
+        lo_pct = 100 * clip_lo[i] / n
+        hi_pct = 100 * clip_hi[i] / n
+        flag_lo = " !" if lo_pct > 5 else ""
+        flag_hi = " !" if hi_pct > 5 else ""
+        print(
+            f"  {ch:>4}   {lut[:, i].min():>6.3f}  {lut[:, i].max():>6.3f}  "
+            f"{lut[:, i].mean():>6.3f}  {lo_pct:>6.1f}%{flag_lo}  {hi_pct:>6.1f}%{flag_hi}"
+        )
+    print(f"  Output at black  (0,0,0): ({lut[black_idx, 0]:.3f}, {lut[black_idx, 1]:.3f}, {lut[black_idx, 2]:.3f})")
+    print(f"  Output at gray (0.5,0.5): ({lut[gray_idx, 0]:.3f}, {lut[gray_idx, 1]:.3f}, {lut[gray_idx, 2]:.3f})")
+    print(f"  Output at white  (1,1,1): ({lut[white_idx, 0]:.3f}, {lut[white_idx, 1]:.3f}, {lut[white_idx, 2]:.3f})")
+
+
 def main():
-    print(f"Generating {len(FILM_SIMS)} LUTs at {LUT_SIZE}x{LUT_SIZE}x{LUT_SIZE} ({LUT_SIZE**3} entries each)...")
+    diagnose = "--diagnose" in sys.argv
+
+    if not diagnose:
+        print(f"Generating {len(FILM_SIMS)} LUTs at {LUT_SIZE}x{LUT_SIZE}x{LUT_SIZE} ({LUT_SIZE**3} entries each)...")
+
     base = identity_lut(LUT_SIZE)
 
     for subdir, name, params in FILM_SIMS:
         title = name.replace("_", " ")
-        lut = generate_lut(base, params)
-        path = OUTPUT_ROOT / subdir / f"{name}.cube"
-        write_cube(lut, path, title, LUT_SIZE)
+        pipeline = PIPELINES[params["type"]]
+        lut = pipeline(base, params)
 
-    print(f"\nDone! {len(FILM_SIMS)} .cube files written to {OUTPUT_ROOT}")
+        if diagnose:
+            diagnose_lut(name, lut)
+        else:
+            path = OUTPUT_ROOT / subdir / f"{name}.cube"
+            write_cube(lut, path, title, LUT_SIZE)
+
+    if not diagnose:
+        print(f"\nDone! {len(FILM_SIMS)} .cube files written to {OUTPUT_ROOT}")
 
 
 if __name__ == "__main__":

@@ -11,10 +11,10 @@ actor ThumbnailService {
         self.processor = ImageProcessor(context: context)
     }
 
-    func generateThumbnail(for image: CIImage, withEditState editState: EditState? = nil) -> CGImage? {
+    func generateThumbnail(for image: CIImage, withEditState editState: EditState? = nil, grainSeed: UInt64 = 0) -> CGImage? {
         var img = image
         if let editState {
-            img = processor.process(image: image, editState: editState)
+            img = processor.process(image: image, editState: editState, grainSeed: grainSeed)
         }
 
         let extent = img.extent

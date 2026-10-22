@@ -2,60 +2,49 @@ import SwiftUI
 
 struct CurveEditorView: View {
     @Environment(EditorViewModel.self) private var viewModel
-    @State private var selectedChannel: CurveChannel = .rgb
-
-    enum CurveChannel: String, CaseIterable {
-        case rgb = "RGB"
-        case red = "Red"
-        case green = "Green"
-        case blue = "Blue"
-
-        var color: Color {
-            switch self {
-            case .rgb: return .white
-            case .red: return .red
-            case .green: return .green
-            case .blue: return .blue
-            }
-        }
-    }
 
     var body: some View {
-        VStack(spacing: 8) {
-            HStack {
-                Text("Curves")
+        @Bindable var vm = viewModel
+
+        VStack(spacing: 10) {
+            HStack(spacing: 8) {
+                Text("Curve")
                     .font(.headline)
                     .foregroundStyle(Color.filmdevText)
-                Spacer()
 
-                Picker("", selection: $selectedChannel) {
-                    ForEach(CurveChannel.allCases, id: \.self) { channel in
-                        Text(channel.rawValue).tag(channel)
+                Button {
+                    viewModel.commitState()
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        vm.editState.rgbCurve = EditState.defaultCurvePoints
                     }
+                    viewModel.endDirectEdit()
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
+                        .font(.caption)
+                        .foregroundStyle(Color.filmdevTextSecondary)
                 }
-                .pickerStyle(.segmented)
-                .frame(width: 180)
+                .buttonStyle(.plain)
+                .disabled(viewModel.editState.rgbCurve == EditState.defaultCurvePoints)
+                .help("Reset curve")
+
+                Spacer()
             }
 
             CurveCanvas(
-                points: curveBinding,
-                color: selectedChannel.color,
-                onChanged: { viewModel.onSliderDragChanged() },
-                onEnded: { viewModel.onSliderDragEnded() }
+                points: $vm.editState.rgbCurve,
+                color: Color.filmdevText,
+                activeColor: Color.filmdevAccent,
+                onBegin: { viewModel.beginDirectEdit() },
+                onChanged: { viewModel.directEditChanged() },
+                onEnded: { viewModel.endDirectEdit() }
             )
-            .frame(height: 200)
+            .frame(height: 220)
             .background(Color.filmdevBackground)
             .clipShape(RoundedRectangle(cornerRadius: 6))
-        }
-    }
-
-    private var curveBinding: Binding<[CGPoint]> {
-        @Bindable var vm = viewModel
-        switch selectedChannel {
-        case .rgb: return $vm.editState.rgbCurve
-        case .red: return $vm.editState.redCurve
-        case .green: return $vm.editState.greenCurve
-        case .blue: return $vm.editState.blueCurve
+            .overlay {
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color.filmdevBorder.opacity(0.9), lineWidth: 1)
+            }
         }
     }
 }
@@ -63,108 +52,241 @@ struct CurveEditorView: View {
 struct CurveCanvas: View {
     @Binding var points: [CGPoint]
     let color: Color
+    let activeColor: Color
+    var onBegin: (() -> Void)?
     var onChanged: (() -> Void)?
     var onEnded: (() -> Void)?
 
     @State private var dragIndex: Int?
+    @State private var didBeginInteraction = false
+
+    private let hitRadius: CGFloat = 24
+    private let handleRadius: CGFloat = 6
+    private let plotInsets = EdgeInsets(top: 12, leading: 14, bottom: 14, trailing: 14)
 
     var body: some View {
         GeometryReader { geometry in
-            let size = geometry.size
+            let plotArea = plotRect(in: geometry.size)
 
             Canvas { context, canvasSize in
-                // Grid lines
-                let gridColor = Color.filmdevBorder.opacity(0.5)
-                for i in 1..<4 {
-                    let pos = CGFloat(i) / 4.0
+                let rect = plotRect(in: canvasSize)
+                drawGrid(in: rect, context: &context)
+                drawReferenceLine(in: rect, context: &context)
 
-                    var hPath = Path()
-                    hPath.move(to: CGPoint(x: 0, y: pos * canvasSize.height))
-                    hPath.addLine(to: CGPoint(x: canvasSize.width, y: pos * canvasSize.height))
-                    context.stroke(hPath, with: .color(gridColor), lineWidth: 0.5)
+                let path = curvePath(in: rect)
+                context.stroke(path, with: .color(color.opacity(0.28)), lineWidth: 5)
+                context.stroke(path, with: .color(color.opacity(0.96)), lineWidth: 2)
 
-                    var vPath = Path()
-                    vPath.move(to: CGPoint(x: pos * canvasSize.width, y: 0))
-                    vPath.addLine(to: CGPoint(x: pos * canvasSize.width, y: canvasSize.height))
-                    context.stroke(vPath, with: .color(gridColor), lineWidth: 0.5)
-                }
+                for (index, point) in points.enumerated() {
+                    let screenPoint = screenPoint(for: point, in: rect)
+                    let isActive = index == dragIndex
+                    let fill = isActive ? activeColor : Color.filmdevSurface
+                    let stroke = isActive ? activeColor : color.opacity(0.92)
 
-                // Diagonal reference
-                var diag = Path()
-                diag.move(to: CGPoint(x: 0, y: canvasSize.height))
-                diag.addLine(to: CGPoint(x: canvasSize.width, y: 0))
-                context.stroke(diag, with: .color(Color.filmdevBorder), lineWidth: 1)
-
-                // Curve
-                let curvePoints = points.map { pt in
-                    CGPoint(x: pt.x * canvasSize.width, y: (1 - pt.y) * canvasSize.height)
-                }
-
-                var curvePath = Path()
-                if let first = curvePoints.first {
-                    curvePath.move(to: first)
-                    for point in curvePoints.dropFirst() {
-                        curvePath.addLine(to: point)
-                    }
-                }
-                context.stroke(curvePath, with: .color(color), lineWidth: 2)
-
-                // Control points
-                for pt in curvePoints {
-                    let rect = CGRect(x: pt.x - 5, y: pt.y - 5, width: 10, height: 10)
-                    context.fill(Path(ellipseIn: rect), with: .color(color))
-                    context.stroke(Path(ellipseIn: rect), with: .color(.white), lineWidth: 1)
+                    context.fill(
+                        Path(ellipseIn: CGRect(
+                            x: screenPoint.x - handleRadius,
+                            y: screenPoint.y - handleRadius,
+                            width: handleRadius * 2,
+                            height: handleRadius * 2
+                        )),
+                        with: .color(fill)
+                    )
+                    context.stroke(
+                        Path(ellipseIn: CGRect(
+                            x: screenPoint.x - handleRadius,
+                            y: screenPoint.y - handleRadius,
+                            width: handleRadius * 2,
+                            height: handleRadius * 2
+                        )),
+                        with: .color(stroke),
+                        lineWidth: isActive ? 2 : 1.4
+                    )
                 }
             }
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { value in
-                        let normalized = CGPoint(
-                            x: value.location.x / size.width,
-                            y: 1 - value.location.y / size.height
-                        )
-
-                        if dragIndex == nil {
-                            // Find closest point
-                            var minDist = CGFloat.infinity
-                            var closest = 0
-                            for (i, pt) in points.enumerated() {
-                                let dx = pt.x * size.width - value.location.x
-                                let dy = (1 - pt.y) * size.height - value.location.y
-                                let dist = sqrt(dx * dx + dy * dy)
-                                if dist < minDist {
-                                    minDist = dist
-                                    closest = i
-                                }
-                            }
-                            if minDist < 30 {
-                                dragIndex = closest
-                            }
-                        }
-
-                        if let idx = dragIndex {
-                            let clampedY = max(0, min(1, normalized.y))
-                            if idx == 0 {
-                                // First endpoint: fixed at x=0
-                                points[idx] = CGPoint(x: 0, y: clampedY)
-                            } else if idx == points.count - 1 {
-                                // Last endpoint: fixed at x=1
-                                points[idx] = CGPoint(x: 1, y: clampedY)
-                            } else {
-                                // Middle points: constrain x between neighbors
-                                let minX = points[idx - 1].x + 0.01
-                                let maxX = points[idx + 1].x - 0.01
-                                let clampedX = max(minX, min(maxX, normalized.x))
-                                points[idx] = CGPoint(x: clampedX, y: clampedY)
-                            }
-                            onChanged?()
-                        }
-                    }
-                    .onEnded { _ in
-                        dragIndex = nil
-                        onEnded?()
-                    }
-            )
+            .contentShape(Rectangle())
+            .gesture(dragGesture(in: plotArea))
+            .onTapGesture(count: 2) { location in
+                removePointIfPossible(at: location, in: plotArea)
+            }
+            .overlay(alignment: .topLeading) {
+                if let index = dragIndex, points.indices.contains(index) {
+                    coordinateLabel(for: points[index])
+                        .padding(8)
+                }
+            }
         }
+    }
+
+    private func coordinateLabel(for point: CGPoint) -> some View {
+        Text("In \(Int(point.x * 255))  ·  Out \(Int(point.y * 255))")
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(Color.filmdevText)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 4))
+    }
+
+    private func dragGesture(in plotRect: CGRect) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                let normalized = normalizedPoint(for: value.location, in: plotRect)
+
+                if dragIndex == nil {
+                    if let existingIndex = closestPoint(to: value.location, in: plotRect, within: hitRadius) {
+                        beginInteractionIfNeeded()
+                        dragIndex = existingIndex
+                    } else {
+                        beginInteractionIfNeeded()
+                        dragIndex = insertPoint(normalized)
+                    }
+                }
+
+                guard let index = dragIndex else { return }
+                updatePoint(at: index, with: normalized)
+                onChanged?()
+            }
+            .onEnded { _ in
+                dragIndex = nil
+                if didBeginInteraction {
+                    didBeginInteraction = false
+                    onEnded?()
+                }
+            }
+    }
+
+    private func beginInteractionIfNeeded() {
+        guard !didBeginInteraction else { return }
+        didBeginInteraction = true
+        onBegin?()
+    }
+
+    @discardableResult
+    private func insertPoint(_ point: CGPoint) -> Int {
+        let clampedX = max(0.01, min(0.99, point.x))
+        let clampedY = max(0, min(1, point.y))
+        let insertIndex = points.firstIndex { $0.x > clampedX } ?? points.count
+        points.insert(CGPoint(x: clampedX, y: clampedY), at: insertIndex)
+        return insertIndex
+    }
+
+    private func updatePoint(at index: Int, with point: CGPoint) {
+        guard points.indices.contains(index) else { return }
+        let clampedY = max(0, min(1, point.y))
+
+        if index == points.startIndex {
+            points[index] = CGPoint(x: 0, y: clampedY)
+            return
+        }
+
+        if index == points.index(before: points.endIndex) {
+            points[index] = CGPoint(x: 1, y: clampedY)
+            return
+        }
+
+        let minX = points[index - 1].x + 0.012
+        let maxX = points[index + 1].x - 0.012
+        let clampedX = max(minX, min(maxX, point.x))
+        points[index] = CGPoint(x: clampedX, y: clampedY)
+    }
+
+    private func removePointIfPossible(at location: CGPoint, in plotRect: CGRect) {
+        guard let index = closestPoint(to: location, in: plotRect, within: hitRadius),
+              index != points.startIndex,
+              index != points.index(before: points.endIndex),
+              points.count > 2 else { return }
+
+        onBegin?()
+        points.remove(at: index)
+        onChanged?()
+        onEnded?()
+    }
+
+    private func closestPoint(to location: CGPoint, in plotRect: CGRect, within radius: CGFloat) -> Int? {
+        var closestIndex: Int?
+        var closestDistance = CGFloat.infinity
+
+        for (index, point) in points.enumerated() {
+            let screenPoint = screenPoint(for: point, in: plotRect)
+            let distance = hypot(screenPoint.x - location.x, screenPoint.y - location.y)
+            if distance < closestDistance {
+                closestDistance = distance
+                closestIndex = index
+            }
+        }
+
+        guard closestDistance <= radius else { return nil }
+        return closestIndex
+    }
+
+    private func drawGrid(in rect: CGRect, context: inout GraphicsContext) {
+        let gridColor = Color.filmdevBorder.opacity(0.58)
+        for index in 1..<4 {
+            let fraction = CGFloat(index) / 4
+
+            var horizontal = Path()
+            horizontal.move(to: CGPoint(x: rect.minX, y: rect.minY + rect.height * fraction))
+            horizontal.addLine(to: CGPoint(x: rect.maxX, y: rect.minY + rect.height * fraction))
+            context.stroke(horizontal, with: .color(gridColor), lineWidth: 0.7)
+
+            var vertical = Path()
+            vertical.move(to: CGPoint(x: rect.minX + rect.width * fraction, y: rect.minY))
+            vertical.addLine(to: CGPoint(x: rect.minX + rect.width * fraction, y: rect.maxY))
+            context.stroke(vertical, with: .color(gridColor), lineWidth: 0.7)
+        }
+    }
+
+    private func drawReferenceLine(in rect: CGRect, context: inout GraphicsContext) {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        context.stroke(
+            path,
+            with: .color(Color.filmdevTextSecondary.opacity(0.55)),
+            style: StrokeStyle(lineWidth: 1, dash: [4, 5])
+        )
+    }
+
+    private func curvePath(in rect: CGRect) -> Path {
+        var path = Path()
+        guard points.count >= 2 else { return path }
+
+        let steps = max(24, Int(rect.width))
+        for step in 0...steps {
+            let x = CGFloat(step) / CGFloat(steps)
+            let y = ImageProcessor.sampleToneCurve(at: x, points: points)
+            let point = screenPoint(for: CGPoint(x: x, y: y), in: rect)
+
+            if step == 0 {
+                path.move(to: point)
+            } else {
+                path.addLine(to: point)
+            }
+        }
+
+        return path
+    }
+
+    private func plotRect(in size: CGSize) -> CGRect {
+        CGRect(
+            x: plotInsets.leading,
+            y: plotInsets.top,
+            width: max(1, size.width - plotInsets.leading - plotInsets.trailing),
+            height: max(1, size.height - plotInsets.top - plotInsets.bottom)
+        )
+    }
+
+    private func screenPoint(for point: CGPoint, in rect: CGRect) -> CGPoint {
+        CGPoint(
+            x: rect.minX + point.x * rect.width,
+            y: rect.maxY - point.y * rect.height
+        )
+    }
+
+    private func normalizedPoint(for location: CGPoint, in rect: CGRect) -> CGPoint {
+        CGPoint(
+            x: max(0, min(1, (location.x - rect.minX) / rect.width)),
+            y: max(0, min(1, 1 - (location.y - rect.minY) / rect.height))
+        )
     }
 }

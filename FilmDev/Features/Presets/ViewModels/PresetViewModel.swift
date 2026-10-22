@@ -11,46 +11,26 @@ final class PresetViewModel {
     private let ciContext: CIContext
 
     init() {
-        let context = CIContext(options: [.useSoftwareRenderer: false])
+        let context = FilmColorPipeline.makeContext()
         self.ciContext = context
         self.thumbnailService = ThumbnailService(context: context)
     }
-
-    private static let presetCatalog: [(fileName: String, category: FilmPreset.PresetCategory)] = [
-        // Fuji - Color
-        ("Provia", .fuji),
-        ("Velvia", .fuji),
-        ("Astia", .fuji),
-        ("Classic_Chrome", .fuji),
-        ("Classic_Neg", .fuji),
-        ("Pro_Neg_Hi", .fuji),
-        ("Pro_Neg_Std", .fuji),
-        ("Eterna", .fuji),
-        ("Eterna_Bleach_Bypass", .fuji),
-        // Fuji - B&W
-        ("Acros", .fuji),
-        ("Monochrome", .fuji),
-        ("Sepia", .fuji),
-        // Kodak
-        ("Portra_400", .kodak),
-        ("Ektar_100", .kodak),
-        ("Gold_200", .kodak),
-        ("Tri_X_400", .kodak),
-        // Ilford
-        ("HP5_Plus", .ilford),
-        ("Delta_3200", .ilford),
-    ]
 
     func loadPresets() {
         guard presets.isEmpty else { return }
         isLoading = true
 
-        let catalog = Self.presetCatalog
+        let catalog = FilmPreset.catalog
         Task.detached {
             var loaded: [FilmPreset] = []
 
             for entry in catalog {
-                guard let url = Bundle.main.url(forResource: entry.fileName, withExtension: "cube") else {
+                // Resolve whether the cubes are bundled with their folder
+                // structure (LUTs/fuji/…) or flattened to the resources root.
+                // Matches EditState.reloadLUTIfNeeded's lookup order.
+                guard let url = Bundle.main.url(forResource: entry.fileName, withExtension: "cube", subdirectory: "LUTs/fuji")
+                       ?? Bundle.main.url(forResource: entry.fileName, withExtension: "cube", subdirectory: "LUTs")
+                       ?? Bundle.main.url(forResource: entry.fileName, withExtension: "cube") else {
                     continue
                 }
 
@@ -59,8 +39,10 @@ final class PresetViewModel {
 
                 var preset = FilmPreset(
                     name: name,
-                    category: entry.category,
-                    fileName: entry.fileName
+                    category: .fuji,
+                    group: entry.group,
+                    fileName: entry.fileName,
+                    defaults: entry.defaults
                 )
 
                 if let lutData = try? LUTParser.parse(cubeFileAt: url) {
@@ -78,7 +60,11 @@ final class PresetViewModel {
         }
     }
 
-    func generateThumbnails(for sourceImage: CIImage) {
+    /// Renders the per-look preview tiles. `analysis` carries the loaded
+    /// frame's measurements so each tile gets the same per-stock auto trims
+    /// the editor will apply — without it, tiles would show the raw decode
+    /// (auto-bright off = dark) instead of the developed look.
+    func generateThumbnails(for sourceImage: CIImage, analysis: ImageAnalysis?) {
         let currentPresets = presets
         let thumbService = thumbnailService
 
@@ -89,6 +75,10 @@ final class PresetViewModel {
                 var editState = EditState()
                 editState.activeLUTData = lutData
                 editState.activeLUTSize = lutSize
+                if let analysis {
+                    editState.autoFields = Set(EditState.EditField.allCases)
+                    editState.applyAutoTrims(PresetIntent.trims(for: analysis, presetFileName: preset.fileName))
+                }
 
                 let thumbnail = await thumbService.generateThumbnail(
                     for: sourceImage,

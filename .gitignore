@@ -21,3 +21,6 @@ FilmDev/Resources/LUTs/
 
 # Claude
 .claude/
+
+# Python
+__pycache__/

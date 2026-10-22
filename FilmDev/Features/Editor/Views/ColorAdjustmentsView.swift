@@ -7,20 +7,10 @@ struct ColorAdjustmentsView: View {
         @Bindable var vm = viewModel
 
         VStack(spacing: 4) {
-            HStack {
-                Text("Color")
-                    .font(.headline)
-                    .foregroundStyle(Color.filmdevText)
-                Spacer()
-            }
-
-            AdjustmentSlider(
-                label: "Hue",
-                value: $vm.editState.hue,
-                range: -.pi ... .pi,
-                format: "°",
-                onDragChanged: { viewModel.onSliderDragChanged() },
-                onDragEnded: { viewModel.onSliderDragEnded() }
+            GroupResetHeader(
+                title: "Color",
+                isDefault: viewModel.editState.isColorDefault,
+                reset: viewModel.resetColorGroup
             )
 
             AdjustmentSlider(

@@ -115,12 +115,29 @@ enum AppError: LocalizedError {
 ## Core Image Pipeline
 All image processing uses Core Image filters chained non-destructively:
 ```
-CIRAWFilter → CIExposureAdjust → CIHighlightShadowAdjust → CIColorCubeWithColorSpace (LUT) → CIToneCurve → render
+libraw decode (camera-WB, no auto-bright, sRGB) → toneShape kernel (exposure/tone)
+→ CIColorCubeWithColorSpace (filmic LUT) → saturation/vibrance → curve
+→ optics (halation + glow, screened blooms) → grain → vignette → render
 ```
 - `CIContext` is created once, backed by Metal
 - Filters are lazy — GPU only executes on render
 - Preview renders at reduced resolution during slider drag
 - Use `Task` cancellation for debouncing rapid updates
+- `ImageAnalyzer` measures each decoded frame (CPU readback of a 256px proxy —
+  do NOT switch it to CIAreaHistogram, which returns size-dependent garbage);
+  `PresetIntent` maps the measurements to per-stock auto trims
+- `EditState.autoFields` tracks which fields auto still owns (provenance);
+  hand-edited fields are demoted and never clobbered by re-derives
+
+## Headless CLI Harness
+`FilmDevCLI` (target `filmdev-cli`) runs the exact app pipeline on a RAW from
+the terminal — use it to tune looks and verify renders without launching the app:
+```
+filmdev-cli photo.arw --preset Classic_Neg --auto --out /tmp/out --scale 0.25
+```
+Flags: `--preset Name|all|none`, `--auto` (analyzer + per-stock trims),
+`--exposure EV`, `--halation/--glow/--grain N` (overrides), `--no-effects`,
+`--scale 0–1`, `--lut-dir`, `--suffix`. Build with scheme `FilmDevCLI`.
 
 ## DO NOT
 - Force unwrap optionals (`!`) — use `guard let` or `if let`
@@ -131,6 +148,11 @@ CIRAWFilter → CIExposureAdjust → CIHighlightShadowAdjust → CIColorCubeWith
 - Use `DispatchQueue` — use Swift Concurrency (`async/await`, `Task`, actors)
 - Add `print()` for debugging — use `os.Logger` if logging is needed
 - Skip `@MainActor` annotations on view models and UI-updating code
+
+## Python Scripts
+- Virtual environment: `scripts/.venv/`
+- Run scripts with: `scripts/.venv/bin/python3 scripts/<script>.py`
+- Do NOT use system python or install packages globally
 
 ## Key Conventions
 - `EditState` is the single source of truth for all adjustments

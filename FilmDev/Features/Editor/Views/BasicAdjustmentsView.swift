@@ -7,22 +7,11 @@ struct BasicAdjustmentsView: View {
         @Bindable var vm = viewModel
 
         VStack(spacing: 4) {
-            HStack {
-                Text("Adjustments")
-                    .font(.headline)
-                    .foregroundStyle(Color.filmdevText)
-                Spacer()
-                Button("Reset") {
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        viewModel.editState = EditState()
-                        viewModel.updatePreview()
-                    }
-                }
-                .font(.caption)
-                .foregroundStyle(Color.filmdevAccent)
-                .buttonStyle(.plain)
-                .disabled(viewModel.editState.isDefault)
-            }
+            GroupResetHeader(
+                title: "Tone",
+                isDefault: viewModel.editState.isToneDefault,
+                reset: viewModel.resetToneGroup
+            )
 
             AdjustmentSlider(
                 label: "Exposure",
@@ -52,22 +41,6 @@ struct BasicAdjustmentsView: View {
             AdjustmentSlider(
                 label: "Shadows",
                 value: $vm.editState.shadows,
-                range: -1.0...1.0,
-                onDragChanged: { viewModel.onSliderDragChanged() },
-                onDragEnded: { viewModel.onSliderDragEnded() }
-            )
-
-            AdjustmentSlider(
-                label: "Whites",
-                value: $vm.editState.whites,
-                range: -1.0...1.0,
-                onDragChanged: { viewModel.onSliderDragChanged() },
-                onDragEnded: { viewModel.onSliderDragEnded() }
-            )
-
-            AdjustmentSlider(
-                label: "Blacks",
-                value: $vm.editState.blacks,
                 range: -1.0...1.0,
                 onDragChanged: { viewModel.onSliderDragChanged() },
                 onDragEnded: { viewModel.onSliderDragEnded() }

@@ -14,6 +14,33 @@ settings:
     PRODUCT_BUNDLE_IDENTIFIER: com.filmdev.app
 
 targets:
+  FilmDevCLI:
+    type: tool
+    platform: macOS
+    sources:
+      - path: FilmDevCLI
+      - path: FilmDev/Core
+        excludes:
+          - "Extensions/Color+Theme.swift"
+      - path: FilmDev/Features/Editor/Models
+      - path: FilmDev/Features/Presets/Models
+    resources:
+      - path: FilmDev/Resources/Fonts
+    settings:
+      base:
+        PRODUCT_NAME: filmdev-cli
+        PRODUCT_BUNDLE_IDENTIFIER: com.filmdev.cli
+        SWIFT_OBJC_BRIDGING_HEADER: FilmDev/FilmDev-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - $(inherited)
+          - /opt/homebrew/opt/libraw/include
+        LIBRARY_SEARCH_PATHS:
+          - $(inherited)
+          - /opt/homebrew/opt/libraw/lib
+        OTHER_LDFLAGS:
+          - $(inherited)
+          - -lraw_r
+
   FilmDev:
     type: application
     platform: macOS
@@ -24,6 +51,7 @@ targets:
     resources:
       - path: FilmDev/Resources/Assets.xcassets
       - path: FilmDev/Resources/LUTs
+      - path: FilmDev/Resources/Fonts
     settings:
       base:
         PRODUCT_NAME: FilmDev
@@ -31,6 +59,52 @@ targets:
         CODE_SIGN_ENTITLEMENTS: FilmDev/FilmDev.entitlements
         ENABLE_HARDENED_RUNTIME: true
         COMBINE_HIDPI_IMAGES: true
+        HEADER_SEARCH_PATHS:
+          - $(inherited)
+          - /opt/homebrew/opt/libraw/include
+        LIBRARY_SEARCH_PATHS:
+          - $(inherited)
+          - /opt/homebrew/opt/libraw/lib
+        OTHER_LDFLAGS:
+          - $(inherited)
+          - -lraw_r
+        SWIFT_OBJC_BRIDGING_HEADER: FilmDev/FilmDev-Bridging-Header.h
+        LD_RUNPATH_SEARCH_PATHS:
+          - $(inherited)
+          - "@executable_path/../Frameworks"
+    postBuildScripts:
+      - name: Embed libraw
+        script: |
+          set -euo pipefail
+
+          libraw_dylib="/opt/homebrew/opt/libraw/lib/libraw_r.23.dylib"
+          app_frameworks_dir="${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}"
+          bundled_libraw="${app_frameworks_dir}/libraw_r.23.dylib"
+
+          if [ ! -f "${libraw_dylib}" ]; then
+            echo "error: libraw dylib not found at ${libraw_dylib}"
+            exit 1
+          fi
+
+          mkdir -p "${app_frameworks_dir}"
+          ditto "${libraw_dylib}" "${bundled_libraw}"
+
+          for binary in \
+            "${TARGET_BUILD_DIR}/${EXECUTABLE_PATH}" \
+            "${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/MacOS/${PRODUCT_NAME}.debug.dylib"
+          do
+            if [ -f "${binary}" ]; then
+              /usr/bin/install_name_tool -change "${libraw_dylib}" "@rpath/libraw_r.23.dylib" "${binary}" || true
+            fi
+          done
+
+          if [ "${CODE_SIGNING_ALLOWED:-NO}" = "YES" ]; then
+            /usr/bin/codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY:--}" --timestamp=none "${bundled_libraw}"
+          fi
+        inputFiles:
+          - /opt/homebrew/opt/libraw/lib/libraw_r.23.dylib
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(FRAMEWORKS_FOLDER_PATH)/libraw_r.23.dylib
     info:
       path: FilmDev/Info.plist
       properties:

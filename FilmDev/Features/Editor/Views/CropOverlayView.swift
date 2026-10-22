@@ -7,14 +7,19 @@ enum CropAspectRatio: String, CaseIterable, Sendable {
     case threeTwo = "3:2"
     case sixteenNine = "16:9"
 
-    var ratio: CGFloat? {
-        switch self {
-        case .free: return nil
-        case .square: return 1.0
-        case .fourThree: return 4.0 / 3.0
-        case .threeTwo: return 3.0 / 2.0
-        case .sixteenNine: return 16.0 / 9.0
+    /// Returns the aspect ratio oriented to match the given image dimensions.
+    /// For a portrait image, a 3:2 ratio returns 2/3 instead of 3/2.
+    func ratio(for imageSize: CGSize) -> CGFloat? {
+        let base: CGFloat? = switch self {
+        case .free: nil
+        case .square: 1.0
+        case .fourThree: 4.0 / 3.0
+        case .threeTwo: 3.0 / 2.0
+        case .sixteenNine: 16.0 / 9.0
         }
+        guard let base else { return nil }
+        let isPortrait = imageSize.height > imageSize.width
+        return isPortrait ? 1.0 / base : base
     }
 }
 
@@ -36,7 +41,8 @@ struct CropOverlayView: View {
     var body: some View {
         GeometryReader { geometry in
             let viewSize = geometry.size
-            let displayRect = normalizedToView(cropRect, in: viewSize)
+            let imageFrame = fittedImageFrame(in: viewSize)
+            let displayRect = normalizedToView(cropRect, in: imageFrame)
 
             ZStack {
                 // Darkened area outside crop
@@ -87,13 +93,16 @@ struct CropOverlayView: View {
                             width: value.location.x - dragStart.x,
                             height: value.location.y - dragStart.y
                         )
-                        let newRect = applyDrag(handle: handle, delta: delta, initial: initialRect, bounds: viewSize)
-                        cropRect = viewToNormalized(newRect, in: viewSize)
+                        let newRect = applyDrag(handle: handle, delta: delta, initial: initialRect, bounds: imageFrame)
+                        cropRect = viewToNormalized(newRect, in: imageFrame)
                     }
                     .onEnded { _ in
                         dragHandle = nil
                     }
             )
+            .onChange(of: aspectRatio) {
+                adjustCropToAspectRatio(in: imageFrame)
+            }
         }
     }
 
@@ -193,7 +202,7 @@ struct CropOverlayView: View {
 
     // MARK: - Drag Application
 
-    private func applyDrag(handle: CropHandle, delta: CGSize, initial: CGRect, bounds: CGSize) -> CGRect {
+    private func applyDrag(handle: CropHandle, delta: CGSize, initial: CGRect, bounds: CGRect) -> CGRect {
         let minSize: CGFloat = 30
         var rect = initial
 
@@ -230,49 +239,106 @@ struct CropOverlayView: View {
         }
 
         // Enforce minimum size
-        if rect.width < minSize {
-            rect.size.width = minSize
-        }
-        if rect.height < minSize {
-            rect.size.height = minSize
-        }
+        rect.size.width = max(rect.size.width, minSize)
+        rect.size.height = max(rect.size.height, minSize)
 
-        // Enforce aspect ratio
-        if let ratio = aspectRatio.ratio {
+        // Enforce aspect ratio, anchoring the corner opposite the dragged handle
+        if let ratio = aspectRatio.ratio(for: imageSize), handle != .center {
             let currentRatio = rect.width / rect.height
+            let anchorRight = [CropHandle.topLeft, .bottomLeft, .left].contains(handle)
+            let anchorBottom = [CropHandle.topLeft, .topRight, .top].contains(handle)
+
             if currentRatio > ratio {
-                rect.size.width = rect.height * ratio
+                let newWidth = rect.height * ratio
+                if anchorRight {
+                    rect.origin.x += rect.width - newWidth
+                }
+                rect.size.width = newWidth
             } else {
-                rect.size.height = rect.width / ratio
+                let newHeight = rect.width / ratio
+                if anchorBottom {
+                    rect.origin.y += rect.height - newHeight
+                }
+                rect.size.height = newHeight
             }
         }
 
         // Clamp to bounds
-        rect.origin.x = max(0, min(rect.origin.x, bounds.width - rect.width))
-        rect.origin.y = max(0, min(rect.origin.y, bounds.height - rect.height))
-        rect.size.width = min(rect.width, bounds.width - rect.origin.x)
-        rect.size.height = min(rect.height, bounds.height - rect.origin.y)
+        rect.origin.x = max(bounds.minX, min(rect.origin.x, bounds.maxX - rect.width))
+        rect.origin.y = max(bounds.minY, min(rect.origin.y, bounds.maxY - rect.height))
+        rect.size.width = min(rect.width, bounds.maxX - rect.origin.x)
+        rect.size.height = min(rect.height, bounds.maxY - rect.origin.y)
 
         return rect
     }
 
+    // MARK: - Aspect Ratio Adjustment
+
+    /// Immediately adjusts the crop rect to match the selected aspect ratio,
+    /// keeping it centered and as large as possible within bounds.
+    private func adjustCropToAspectRatio(in bounds: CGRect) {
+        guard let ratio = aspectRatio.ratio(for: imageSize) else { return }
+
+        let displayRect = normalizedToView(cropRect, in: bounds)
+        let centerX = displayRect.midX
+        let centerY = displayRect.midY
+
+        var newWidth = displayRect.width
+        var newHeight = displayRect.height
+
+        let currentRatio = newWidth / newHeight
+        if currentRatio > ratio {
+            newWidth = newHeight * ratio
+        } else {
+            newHeight = newWidth / ratio
+        }
+
+        var newRect = CGRect(
+            x: centerX - newWidth / 2,
+            y: centerY - newHeight / 2,
+            width: newWidth,
+            height: newHeight
+        )
+
+        // Clamp to bounds
+        newRect.origin.x = max(bounds.minX, min(newRect.origin.x, bounds.maxX - newRect.width))
+        newRect.origin.y = max(bounds.minY, min(newRect.origin.y, bounds.maxY - newRect.height))
+
+        cropRect = viewToNormalized(newRect, in: bounds)
+    }
+
     // MARK: - Coordinate Conversion
 
-    private func normalizedToView(_ normalized: CGRect, in viewSize: CGSize) -> CGRect {
-        CGRect(
-            x: normalized.origin.x * viewSize.width,
-            y: normalized.origin.y * viewSize.height,
-            width: normalized.width * viewSize.width,
-            height: normalized.height * viewSize.height
+    private func fittedImageFrame(in viewSize: CGSize) -> CGRect {
+        guard imageSize.width > 0, imageSize.height > 0 else {
+            return CGRect(origin: .zero, size: viewSize)
+        }
+
+        let scale = min(viewSize.width / imageSize.width, viewSize.height / imageSize.height)
+        let fittedSize = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+        return CGRect(
+            x: (viewSize.width - fittedSize.width) / 2,
+            y: (viewSize.height - fittedSize.height) / 2,
+            width: fittedSize.width,
+            height: fittedSize.height
         )
     }
 
-    private func viewToNormalized(_ viewRect: CGRect, in viewSize: CGSize) -> CGRect {
+    private func normalizedToView(_ normalized: CGRect, in bounds: CGRect) -> CGRect {
         CGRect(
-            x: viewRect.origin.x / viewSize.width,
-            y: viewRect.origin.y / viewSize.height,
-            width: viewRect.width / viewSize.width,
-            height: viewRect.height / viewSize.height
+            x: bounds.minX + normalized.origin.x * bounds.width,
+            y: bounds.minY + normalized.origin.y * bounds.height,
+            width: normalized.width * bounds.width,
+            height: normalized.height * bounds.height
+        )
+    }
+
+    private func viewToNormalized(_ viewRect: CGRect, in bounds: CGRect) -> CGRect {
+        CGRect(
+            x: (viewRect.origin.x - bounds.minX) / bounds.width,
+            y: (viewRect.origin.y - bounds.minY) / bounds.height,
+            width: viewRect.width / bounds.width,
+            height: viewRect.height / bounds.height
         )
     }
 }
